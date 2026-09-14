@@ -1,0 +1,178 @@
+name: Generic Nuget Publish
+
+on:
+  workflow_call:
+    inputs:
+      # .NET SDK version used to build and publish the NuGet package
+      dotnet-version:
+        required: false
+        type: string
+        default: '10.0.x'
+
+      # Minimum package version.
+      # If the latest Git tag is lower, this exact version is used.
+      initial-version:
+        required: false
+        type: string
+        default: '10.0.0'
+
+      # Relative path to the .csproj file in the calling repository
+      project-path:
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    # Prevent two runs from generating the same version simultaneously
+    concurrency:
+      group: nuget-publish-${{ github.repository }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      # Step 1: Checkout the calling repository with complete tag history
+      - name: Checkout Library Repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # Step 2: Install .NET
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      # Step 3: Determine the package version
+      #
+      # Examples:
+      # Latest tag v10.0.0 and initial-version 10.0.0 -> 10.0.1
+      - name: Generate Package Version
+        shell: bash
+        env:
+          INITIAL_VERSION: ${{ inputs.initial-version }}
+        run: |
+          set -euo pipefail
+
+          git fetch --tags --force
+
+          VERSION_PATTERN='^[0-9]+\.[0-9]+\.[0-9]+$'
+
+          if [[ ! "$INITIAL_VERSION" =~ $VERSION_PATTERN ]]; then
+            echo "Invalid initial-version: $INITIAL_VERSION"
+            echo "Expected format: MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+
+          LATEST_TAG=$(
+            git tag -l "v[0-9]*.[0-9]*.[0-9]*" \
+              --sort=-v:refname |
+            head -n 1
+          )
+
+          if [ -z "$LATEST_TAG" ]; then
+            VERSION="$INITIAL_VERSION"
+          else
+            CURRENT_VERSION="${LATEST_TAG#v}"
+
+            if [[ ! "$CURRENT_VERSION" =~ $VERSION_PATTERN ]]; then
+              echo "Invalid version tag: $LATEST_TAG"
+              exit 1
+            fi
+
+            HIGHEST_VERSION=$(
+              printf '%s\n%s\n' "$CURRENT_VERSION" "$INITIAL_VERSION" |
+              sort -V |
+              tail -n 1
+            )
+
+            if [ "$HIGHEST_VERSION" = "$INITIAL_VERSION" ] &&
+               [ "$CURRENT_VERSION" != "$INITIAL_VERSION" ]; then
+              # Existing version is below the configured starting version
+              VERSION="$INITIAL_VERSION"
+            else
+              IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+              VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+            fi
+          fi
+
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "LATEST_TAG=${LATEST_TAG:-none}"
+          echo "Publishing NuGet version: $VERSION"
+
+      # Step 4: Configure GitHub Packages
+      - name: Add GitHub Packages NuGet Source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dotnet nuget remove source github || true
+
+          dotnet nuget add source \
+            "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" \
+            --name "github" \
+            --username "${{ github.actor }}" \
+            --password "${{ secrets.GITHUB_TOKEN }}" \
+            --store-password-in-clear-text
+
+      # Step 5: Show configured sources
+      - name: Show NuGet Sources
+        run: dotnet nuget list source
+
+      # Step 6: Restore dependencies
+      - name: Restore
+        run: |
+          dotnet restore "${{ inputs.project-path }}"
+
+      # Step 7: Build in Release mode
+      - name: Build
+        run: |
+          dotnet build "${{ inputs.project-path }}" \
+            --configuration Release \
+            --no-restore
+
+      # Step 8: Create the NuGet package
+      - name: Pack
+        run: |
+          dotnet pack "${{ inputs.project-path }}" \
+            --configuration Release \
+            --no-build \
+            --output ./packages \
+            /p:PackageVersion="$VERSION"
+
+      # Step 9: Show generated packages
+      - name: Show Generated Packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Generated NuGet packages:"
+          ls -la ./packages
+
+      # Step 10: Publish to GitHub Packages
+      - name: Publish to GitHub Packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dotnet nuget push "./packages/*.nupkg" \
+            --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" \
+            --api-key "${{ secrets.GITHUB_TOKEN }}" \
+            --skip-duplicate
+
+      # Step 11: Create the version tag only after successful publishing
+      - name: Create Version Tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
